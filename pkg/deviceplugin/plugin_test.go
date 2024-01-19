@@ -90,7 +90,16 @@ var _ = Describe("Macvtap", func() {
 		var sendSpy *ListAndWatchServerSendSpy
 
 		BeforeEach(func() {
-			mvdp = NewMacvtapDevicePlugin(lowerDeviceIfaceName, lowerDeviceIfaceName, "bridge", 0, testNs.Path())
+			config := &macvtapConfig{
+				Config: Config{
+					Name:        lowerDeviceIfaceName,
+					LowerDevice: lowerDeviceIfaceName,
+					Mode:        "bridge",
+					Capacity:    0,
+				},
+				update: make(chan struct{}),
+			}
+			mvdp = NewMacvtapDevicePlugin(config, testNs.Path(), false)
 			sendSpy = &ListAndWatchServerSendSpy{}
 			go func() {
 				err := mvdp.ListAndWatch(nil, sendSpy)
@@ -166,7 +175,7 @@ var _ = Describe("Macvtap", func() {
 
 		BeforeEach(func() {
 			pluginListCh = make(chan dpm.PluginNameList)
-			lister = NewMacvtapLister(testNs.Path())
+			lister = NewMacvtapLister(testNs.Path(), ListerTypeConfigEnv)
 		})
 
 		JustBeforeEach(func() {

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: macvtap-cni
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      name: macvtap-cni
+  template:
+    metadata:
+      labels:
+        name: macvtap-cni
+    spec:
+      hostNetwork: true
+      hostPID: true
+      priorityClassName: system-node-critical
+      containers:
+      - name: macvtap-cni
+        command: ["/macvtap-deviceplugin", "-v", "3", "-logtostderr"]
+        image: registry.tydic.com/kubevirt/macvtap-cni:latest
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: "60m"
+            memory: "30Mi"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - name: deviceplugin
+            mountPath: /var/lib/kubelet/device-plugins
+          - name: deviceplugin-config
+            mountPath: /macvtap-deviceplugin-config
+      initContainers:
+      - name: install-cni
+        command: ["cp", "/macvtap-cni", "/host/opt/cni/bin/macvtap"]
+        image: registry.tydic.com/kubevirt/macvtap-cni:latest
+        imagePullPolicy: Always
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "15Mi"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - name: cni
+            mountPath: /host/opt/cni/bin
+            mountPropagation: Bidirectional
+      volumes:
+        - name: deviceplugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: deviceplugin-config
+          configMap:
+            name: macvtap-deviceplugin-config
+        - name: cni
+          hostPath:
+            path: /opt/cni/bin

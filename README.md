@@ -47,6 +47,12 @@ $ kubectl apply -f https://raw.githubusercontent.com/kubevirt/macvtap-cni/main/e
 configmap "macvtap-deviceplugin-config" created
 ```
 
+当前分支部署方式
+
+```bash
+$ kubectl apply -f manifests/macvtap.yaml
+```
+
 This configuration will result in up to 50 macvtap interfaces being offered for
 consumption, using eth0 as the lower device, in bridge mode, and under
 resource name `macvtap.network.kubevirt.io/dataplane`.
@@ -96,6 +102,57 @@ spec:
     }'
 ```
 
+定义multus附加网卡并结合kube-ovn的ipam功能，集中式分配网卡ip和mac
+
+```yaml
+kind: NetworkAttachmentDefinition
+apiVersion: k8s.cni.cncf.io/v1
+metadata:
+  name: p4p1
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: macvtap.network.kubevirt.io/p4p1
+spec:
+  config: '{
+      "cniVersion": "0.3.1",
+      "name": "p4p1",
+      "type": "macvtap",
+      "mtu": 1500,
+      "mode": "bridge",
+      "promiscMode": true,
+      "ipam": {
+        "type": "kube-ovn",
+        "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+        "provider": "p4p1.default"
+      }
+    }'
+```
+
+定义kube-ovn的subnet资源，让kube-ovn的相关注解生效
+
+```yaml
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  annotations:
+    # 和dcloud2.0的iaas结合，需要说明这个subnet创建的虚拟机所使用的网络模式
+    dcloud.tydic.io/interface-type: macvtap
+  name: p4p1
+spec:
+  cidrBlock: 172.31.0.0/24
+  default: false
+  disableGatewayCheck: true
+  excludeIps:
+  - 172.31.0.1..172.31.0.40
+  gateway: 172.31.0.1
+  gatewayNode: ""
+  gatewayType: distributed
+  natOutgoing: false
+  private: false
+  protocol: IPv4
+  provider: p4p1.default
+  vpc: ovn-cluster
+```
+
 The CNI config json allows the following parameters:
 * `name`     (string, required): the name of the network. Optional when used within a
    NetworkAttachmentDefinition, as Multus provides the name in that case.
@@ -128,6 +185,51 @@ spec:
         macvtap.network.kubevirt.io/dataplane: 1 
 ``` 
 
+结合kube-ovn创建的pod 
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  annotations:
+    k8s.v1.cni.cncf.io/networks: p4p1
+    # 指定ovn使用的子网： subnet name
+    p4p1.default.kubernetes.io/logical_switch: p4p1
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["/bin/sleep", "1800"]
+    resources:
+      limits:
+        # 指定要分配给pod的macvtap资源
+        macvtap.network.kubevirt.io/p4p1: 1 
+``` 
+
+结合kube-ovn创建指定ip的pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  annotations:
+    k8s.v1.cni.cncf.io/networks: default/p4p1
+    # 指定ovn使用的子网： subnet name
+    p4p1.default.kubernetes.io/logical_switch: p4p1
+    p4p1.default.kubernetes.io/ip_address: 172.31.0.10
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["/bin/sleep", "1800"]
+    resources:
+      limits:
+        # 指定要分配给pod的macvtap资源
+        macvtap.network.kubevirt.io/p4p1: 1 
+``` 
+
 A mac can also be assigned to the interface through the network annotation:
 
 ```yaml
@@ -151,6 +253,83 @@ spec:
     resources:
       limits:
         macvtap.network.kubevirt.io/dataplane: 1 
+```
+
+结合kube-ovn创建指定网卡mac地址的pod 
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-mac
+  annotations:
+    # 指定ovn使用的子网： subnet name
+    p4p1.default.kubernetes.io/logical_switch: p4p1
+    # 可以直接通过ovn注解指定mac地址
+    p4p1.default.kubernetes.io/mac_address: "02:23:45:67:89:01"
+    # k8s.v1.cni.cncf.io/networks: default/p4p1 
+    k8s.v1.cni.cncf.io/networks: |
+      [
+        {
+          "name":"default/p4p1",
+          "mac": "02:23:45:67:89:01" # 如果再这里定义了mac地址，要和ovn注解的mac地址保持一致，否则默认以ipam分配的地址为主
+        }
+      ]
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["/bin/sleep", "1800"]
+    resources:
+      limits:
+        macvtap.network.kubevirt.io/p4p1: 1 
+```
+
+结合kube-ovn创建指定网卡ip和mac地址的pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-mac
+  annotations:
+    # 指定ovn使用的子网： subnet name
+    p4p1.default.kubernetes.io/logical_switch: p4p1
+    p4p1.default.kubernetes.io/mac_address: "02:23:45:67:89:01"
+    p4p1.default.kubernetes.io/ip_address: 172.31.0.10
+    k8s.v1.cni.cncf.io/networks: default/p4p1
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["/bin/sleep", "1800"]
+    resources:
+      limits:
+        macvtap.network.kubevirt.io/p4p1: 1 
+```
+
+结合kube-ovn创建以multus附加网卡为默认网卡的pod（pod不分配k8s默认pod网络网卡，以macvtap作为主网卡）
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-mac
+  annotations:
+    # 指定ovn使用的子网： subnet name
+    p4p1.default.kubernetes.io/logical_switch: p4p1
+    p4p1.default.kubernetes.io/mac_address: "02:23:45:67:89:01"
+    p4p1.default.kubernetes.io/ip_address: 172.31.0.10
+    # 指定附加网络资源名称
+    v1.multus-cni.io/default-network: default/p4p1
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command: ["/bin/sleep", "1800"]
+    resources:
+      limits:
+        macvtap.network.kubevirt.io/p4p1: 1 
 ```
 
 **Note:** The resource limit can be ommited from the pod definition if 

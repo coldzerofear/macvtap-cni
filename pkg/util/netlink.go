@@ -163,7 +163,6 @@ func OnSuitableMacvtapParentEvent(nsPath string, do func(), stop <-chan struct{}
 // * A first time, after first subscription
 // * Once every re-subscription
 // * On any event matching the predicate
-//
 func onLinkEvent(match func(netlink.Link) bool, nsPath string, do func(), stop <-chan struct{}, errcb func(error)) {
 	done := make(chan struct{})
 	defer close(done)
@@ -223,6 +222,42 @@ func onLinkEvent(match func(netlink.Link) bool, nsPath string, do func(), stop <
 			return
 		}
 	}
+}
+
+func SetInterfaceMacAddress(ifaceName string, macAddr *net.HardwareAddr, netns ns.NetNS) error {
+	err := netns.Do(func(_ ns.NetNS) error {
+		macvtapIface, err := netlink.LinkByName(ifaceName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup device %q: %v", ifaceName, err)
+		}
+		if err = netlink.LinkSetDown(macvtapIface); err != nil {
+			return err
+		}
+		if err = netlink.LinkSetHardwareAddr(macvtapIface, *macAddr); err != nil {
+			return fmt.Errorf("failed to add hardware addr to %q: %v", ifaceName, err)
+		}
+		if err := netlink.LinkSetUp(macvtapIface); err != nil {
+			return fmt.Errorf("failed to set macvtap iface up: %v", err)
+		}
+		return nil
+	})
+	return err
+}
+
+func HasInterfaceInNs(ifaceName string, netns ns.NetNS) bool {
+	isNotFound := true
+	_ = netns.Do(func(_ ns.NetNS) error {
+		_, err := netlink.LinkByName(ifaceName)
+		_, isNotFound = err.(netlink.LinkNotFoundError)
+		return err
+	})
+	return !isNotFound
+}
+
+func HasInterface(ifaceName string) bool {
+	_, err := netlink.LinkByName(ifaceName)
+	_, ok := err.(netlink.LinkNotFoundError)
+	return !ok
 }
 
 // Move an existing macvtap interface from the current netns to the target netns, and rename it..

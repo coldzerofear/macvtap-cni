@@ -1,10 +1,10 @@
-// Copyright 2015 go-swagger maintainers
+// Copyright 2016 CNI authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//    http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,22 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package swag
+package invoke
 
-import "mime/multipart"
-
-// File represents an uploaded file.
-type File struct {
-	Data   multipart.File
-	Header *multipart.FileHeader
-}
-
-// Read bytes from the file
-func (f *File) Read(p []byte) (n int, err error) {
-	return f.Data.Read(p)
-}
-
-// Close the file
-func (f *File) Close() error {
-	return f.Data.Close()
-}
+// Valid file extensions for plugin executables.
+var ExecutableFileExtensions = []string{".exe", ""}

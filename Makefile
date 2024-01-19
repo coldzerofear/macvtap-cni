@@ -2,7 +2,7 @@ CNI_MOUNT_PATH ?= /opt/cni/bin
 DEVICE_PLUGIN_CONFIG_MAP_NAME ?= macvtap-deviceplugin-config
 
 IMAGE_NAME ?= macvtap-cni
-IMAGE_REGISTRY ?= quay.io/kubevirt
+IMAGE_REGISTRY ?= registry.tydic.com/kubevirt
 IMAGE_PULL_POLICY ?= Always
 IMAGE_TAG ?= latest
 

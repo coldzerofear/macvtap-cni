@@ -2,11 +2,11 @@ package deviceplugin
 
 import (
 	"fmt"
-
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+	"sort"
 
 	"github.com/kubevirt/macvtap-cni/pkg/util"
 )
@@ -22,23 +22,19 @@ const (
 )
 
 type macvtapDevicePlugin struct {
-	Name        string
-	LowerDevice string
-	Mode        string
-	Capacity    int
+	*macvtapConfig
+	preferredAllocation bool
 	// NetNsPath is the path to the network namespace the plugin operates in.
 	NetNsPath   string
 	stopWatcher chan struct{}
 }
 
-func NewMacvtapDevicePlugin(name string, lowerDevice string, mode string, capacity int, netNsPath string) *macvtapDevicePlugin {
+func NewMacvtapDevicePlugin(config *macvtapConfig, netNsPath string, sort bool) *macvtapDevicePlugin {
 	return &macvtapDevicePlugin{
-		Name:        name,
-		LowerDevice: lowerDevice,
-		Mode:        mode,
-		Capacity:    capacity,
-		NetNsPath:   netNsPath,
-		stopWatcher: make(chan struct{}),
+		macvtapConfig:       config,
+		preferredAllocation: sort,
+		NetNsPath:           netNsPath,
+		stopWatcher:         make(chan struct{}),
 	}
 }
 
@@ -64,22 +60,12 @@ func (mdp *macvtapDevicePlugin) generateMacvtapDevices() []*pluginapi.Device {
 func (mdp *macvtapDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 	// Initialize two arrays, one for devices offered when lower device exists,
 	// and no devices if lower device does not exist.
-	allocatableDevs := mdp.generateMacvtapDevices()
-	emptyDevs := make([]*pluginapi.Device, 0)
 
-	emitResponse := func(lowerDeviceExists bool) {
-		if lowerDeviceExists {
-			glog.V(3).Info("LowerDevice exists, sending ListAndWatch response with available devices")
-			s.Send(&pluginapi.ListAndWatchResponse{Devices: allocatableDevs})
-		} else {
-			glog.V(3).Info("LowerDevice does not exist, sending ListAndWatch response with no devices")
-			s.Send(&pluginapi.ListAndWatchResponse{Devices: emptyDevs})
-		}
-	}
-
-	didLowerDeviceExist := false
 	onLowerDeviceEvent := func() {
-		var doesLowerDeviceExist bool
+		mdp.RLock()
+		defer mdp.RUnlock()
+
+		doesLowerDeviceExist := false
 		err := ns.WithNetNSPath(mdp.NetNsPath, func(_ ns.NetNS) error {
 			var err error
 			doesLowerDeviceExist, err = util.LinkExists(mdp.LowerDevice)
@@ -89,29 +75,48 @@ func (mdp *macvtapDevicePlugin) ListAndWatch(e *pluginapi.Empty, s pluginapi.Dev
 			glog.Warningf("Error while checking on lower device %s: %v", mdp.LowerDevice, err)
 			return
 		}
-
-		if didLowerDeviceExist != doesLowerDeviceExist {
-			emitResponse(doesLowerDeviceExist)
-			didLowerDeviceExist = doesLowerDeviceExist
+		var allocatableDevs []*pluginapi.Device
+		if doesLowerDeviceExist {
+			glog.V(3).Infof("LowerDevice %s exists, sending ListAndWatch response with available devices", mdp.LowerDevice)
+			allocatableDevs = mdp.generateMacvtapDevices()
+		} else {
+			glog.V(3).Info("LowerDevice %s does not exist, sending ListAndWatch response with no devices", mdp.LowerDevice)
+			allocatableDevs = make([]*pluginapi.Device, 0)
 		}
+		_ = s.Send(&pluginapi.ListAndWatchResponse{Devices: allocatableDevs})
 	}
 
+loop:
+	stopCh := make(chan struct{})
 	// Listen for events of lower device interface. On any, check if lower
 	// device exists. If it does, offer up to capacity macvtap devices. Do
 	// not offer any otherwise.
-	util.OnLinkEvent(
+
+	go util.OnLinkEvent(
 		mdp.LowerDevice,
 		mdp.NetNsPath,
 		onLowerDeviceEvent,
-		mdp.stopWatcher,
+		stopCh,
 		func(err error) {
 			glog.Error(err)
 		})
 
-	return nil
+	for {
+		select {
+		case <-mdp.update:
+			close(stopCh)
+			onLowerDeviceEvent()
+			goto loop
+		case <-mdp.stopWatcher:
+			close(stopCh)
+			glog.Warningf("Stop device plugin name: %s, lowerDevice: %s", mdp.Name, mdp.LowerDevice)
+			return nil
+		}
+	}
 }
 
 func (mdp *macvtapDevicePlugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
+	glog.Info("assign macvtap network devices: ", &r.ContainerRequests)
 	var response pluginapi.AllocateResponse
 
 	for _, req := range r.ContainerRequests {
@@ -129,14 +134,21 @@ func (mdp *macvtapDevicePlugin) Allocate(ctx context.Context, r *pluginapi.Alloc
 			// its state.
 			var index int
 			err := ns.WithNetNSPath(mdp.NetNsPath, func(_ ns.NetNS) error {
+				mdp.RLock()
+				defer mdp.RUnlock()
 				var err error
+				glog.Info("create macvtap link ", "deviceName:", name, ",lowerDeviceName:", mdp.LowerDevice, ",mode:", mdp.Mode)
 				index, err = util.RecreateMacvtap(name, mdp.LowerDevice, mdp.Mode)
+				if err != nil {
+					glog.Errorf("create macvtap failed: ", err.Error())
+				}
 				return err
 			})
 			if err != nil {
 				return nil, err
 			}
-
+			// 在宿主机上创建的macvtap设备分配给容器/授予权限
+			// 下一步将在容器启动调用cni时将其设备命名空间移动到容器下
 			devPath := fmt.Sprint(tapPath, index)
 			dev.HostPath = devPath
 			dev.ContainerPath = devPath
@@ -148,7 +160,7 @@ func (mdp *macvtapDevicePlugin) Allocate(ctx context.Context, r *pluginapi.Alloc
 			Devices: devices,
 		})
 	}
-
+	glog.Info("network device allocation successful: ", &response.ContainerResponses)
 	return &response, nil
 }
 
@@ -157,11 +169,28 @@ func (mdp *macvtapDevicePlugin) PreStartContainer(context.Context, *pluginapi.Pr
 }
 
 func (mdp *macvtapDevicePlugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
-	return &pluginapi.DevicePluginOptions{}, nil
+	return &pluginapi.DevicePluginOptions{
+		GetPreferredAllocationAvailable: mdp.preferredAllocation,
+	}, nil
 }
 
-func (mdp *macvtapDevicePlugin) GetPreferredAllocation(context.Context, *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
-	return nil, nil
+func (mdp *macvtapDevicePlugin) GetPreferredAllocation(_ context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	glog.Info("Into GetPreferredAllocation: ", &req.ContainerRequests)
+	response := make([]*pluginapi.ContainerPreferredAllocationResponse, len(req.ContainerRequests))
+	resp := &pluginapi.PreferredAllocationResponse{
+		ContainerResponses: response,
+	}
+	for i, request := range req.GetContainerRequests() {
+		availableDeviceIDs := request.GetAvailableDeviceIDs()
+		glog.V(3).Info("current container[", i, "] request AvailableDeviceIDs: ", availableDeviceIDs)
+		glog.V(3).Info("current container[", i, "] request MustIncludeDeviceIDs: ", request.GetMustIncludeDeviceIDs())
+		glog.V(3).Info("current container[", i, "] request AllocationSize: ", request.GetAllocationSize())
+		sort.Strings(availableDeviceIDs)
+		response[i] = &pluginapi.ContainerPreferredAllocationResponse{
+			DeviceIDs: availableDeviceIDs[0:request.GetAllocationSize()],
+		}
+	}
+	return resp, nil
 }
 
 func (mdp *macvtapDevicePlugin) Stop() error {

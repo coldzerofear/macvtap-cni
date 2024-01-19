@@ -1,0 +1,9 @@
+## 改造用挂载ConfigMap卷的方式而不是Env的方式注入环境配置实现修改ConfigMap时插件热更新
+
+目前以Env的方式挂载ConfigMap环境配置，只会在容器启动时初始化环境变量，中途修改ConfigMap无法热更新到业务容器，需要重启Pod以应用更改。
+
+https://blog.csdn.net/weixin_41988331/article/details/99600292
+
+使用ConfigMap卷的方式将配置参数挂载到容器中的文件，在修改ConfigMap时，kubelet会将更改更新到文件中。
+
+通过一个独立协程去watch配置文件的变化，当ConfigMap被更新时，根据新配置重新启动DevicePlugin实现热更新。

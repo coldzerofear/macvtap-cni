@@ -15,5 +15,5 @@ Dependency bumps:
 - bump golang.org/x/net to 0.17.0 - #107
 
 ```
-docker pull quay.io/kubevirt/macvtap-cni:v0.11.1
+docker pull v0.11.1
 ```

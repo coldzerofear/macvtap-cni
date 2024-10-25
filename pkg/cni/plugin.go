@@ -16,23 +16,21 @@ package cni
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"github.com/containernetworking/cni/pkg/skel"
-	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/current"
-	"github.com/kubevirt/macvtap-cni/pkg/util"
-	"github.com/vishvananda/netlink"
 	"log"
 	"net"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/containernetworking/cni/pkg/skel"
+	"github.com/containernetworking/cni/pkg/types"
+	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/utils/sysctl"
+	"github.com/kubevirt/macvtap-cni/pkg/util"
 )
 
 // A NetConf structure represents a Multus network attachment definition configuration
@@ -61,7 +59,7 @@ var logger *log.Logger
 func init() {
 	logFile, err := os.OpenFile("/opt/cni/bin/macvtap.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		log.Panic("打开日志文件异常")
+		log.Panic("Initialization log file error", err)
 	}
 	logger = log.New(logFile, "[macvtap]", log.Ldate|log.Ltime|log.Lshortfile)
 	// this ensures that main runs only on main thread (thread group leader).
@@ -113,16 +111,20 @@ func CmdAdd(args *skel.CmdArgs) error {
 		"Path: ", args.Path,
 		"StdinData: ", string(args.StdinData))
 
-	var err error
-	netConf, cniVersion, err := loadConf(args.StdinData, args.Args)
+	var (
+		netConf    *NetConf
+		cniVersion string
+		mac        *net.HardwareAddr
+		err        error
+	)
+	netConf, cniVersion, err = loadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
 	}
 
-	marshal, _ := json.Marshal(netConf)
-	logger.Println("NetConf: ", string(marshal))
+	netConfBytes, _ := json.Marshal(netConf)
+	logger.Println("Add NetConf: ", string(netConfBytes))
 
-	var mac *net.HardwareAddr = nil
 	if netConf.Mac != "" {
 		aMac, err := net.ParseMAC(netConf.Mac)
 		mac = &aMac
@@ -131,94 +133,37 @@ func CmdAdd(args *skel.CmdArgs) error {
 		}
 	}
 
-	isLayer3 := netConf.IPAM.Type != ""
-
 	netns, err := ns.GetNS(args.Netns)
 	if err != nil {
 		return fmt.Errorf("failed to open netns %q: %v", netns, err)
 	}
+	// Close netns context
+	defer netns.Close()
 
-	// Delete link if err to avoid link leak in this ns
-	defer func() {
-		netns.Close()
-		if err != nil {
-			util.LinkDelete(netConf.DeviceID)
-		}
-	}()
-	var macvtapInterface *current.Interface = nil
-	if util.HasInterface(netConf.DeviceID) {
-		// 网卡设备在host网络命名空间，将其移动到容器网络命名空间并配置
-		macvtapInterface, err = util.ConfigureInterface(netConf.DeviceID, args.IfName, mac, netConf.MTU, netConf.IsPromiscuous, netns)
-		if err != nil {
-			return err
-		}
-	} else if util.HasInterfaceInNs(args.IfName, netns) {
-		// 网卡设备在容器网络命名空间下
-		if err = netns.Do(func(_ ns.NetNS) error {
-			l, err := netlink.LinkByName(args.IfName)
-			if err != nil {
-				return err
-			}
-			macvtapInterface = &current.Interface{
-				Name:    args.IfName,
-				Mac:     l.Attrs().HardwareAddr.String(),
-				Sandbox: netns.Path(),
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	} else {
-		// 没找到网卡设备则报错
-		return fmt.Errorf("failed to lookup device %q: %s", netConf.DeviceID, "Link not found")
-	}
-
-	// Assume L2 interface only
-	result := &current.Result{
-		CNIVersion: cniVersion,
-		Interfaces: []*current.Interface{macvtapInterface},
-	}
+	var (
+		macvtapInterface *current.Interface
+		result           = &current.Result{CNIVersion: cniVersion}
+		isLayer3         = netConf.IPAM.Type != ""
+	)
 
 	if isLayer3 {
 		logger.Println("Need ", netConf.IPAM.Type, " IPAM to allocate address")
 
-		// run the IPAM plugin and get back the config to apply
-		r, err := ipam.ExecAdd(netConf.IPAM.Type, args.StdinData)
+		ipamResult, err := util.ExecIPAMAdd(netConf.IPAM.Type, args.StdinData)
 		if err != nil {
-			logger.Println("Exec IPAM plugin error: ", err.Error())
+			logger.Println(err)
 			return err
 		}
 
-		// Invoke ipam del if err to avoid ip leak
-		defer func() {
-			if err != nil {
-				ipam.ExecDel(netConf.IPAM.Type, args.StdinData)
-			}
-		}()
+		ipamBytes, _ := json.Marshal(ipamResult)
+		logger.Println("ipamResult: ", string(ipamBytes))
 
-		// Convert whatever the IPAM result was into the current Result type
-		ipamResult, err := current.NewResultFromResult(r)
-		if err != nil {
-			logger.Println("Convert IPAM result error: ", err.Error())
-			return err
-		}
-
-		irs, _ := json.Marshal(ipamResult)
-		logger.Println("ipamResult: ", string(irs))
-
-		// 没有分配到IP只抛出错误不回收连接
-		if len(ipamResult.IPs) == 0 {
-			return errors.New("IPAM plugin returned missing IP config")
-		}
-
-		ipamMacStr := ""
+		// Prioritize using the MAC address distributed by IPAM
 		for _, iface := range ipamResult.Interfaces {
-			if iface != nil && iface.Mac != "" {
-				ipamMacStr = iface.Mac
+			if iface != nil && len(iface.Mac) > 0 {
 				macAddr, err := net.ParseMAC(iface.Mac)
 				if err != nil {
 					logger.Println("failed to parse mac address: ", err.Error())
-					//return fmt.Errorf("failed to parse mac address: %v", err)
 					continue
 				}
 				mac = &macAddr
@@ -226,57 +171,81 @@ func CmdAdd(args *skel.CmdArgs) error {
 			}
 		}
 
-		// reset mac
-		if ipamMacStr != "" && !strings.EqualFold(ipamMacStr, netConf.Mac) {
-			if err = util.SetInterfaceMacAddress(args.IfName, mac, netns); err != nil {
-				logger.Println("failed to set mac address: ", err.Error())
-				return err
-			}
-			macvtapInterface.Mac = ipamMacStr
-		}
-
 		result.IPs = ipamResult.IPs
 		result.Routes = ipamResult.Routes
 		result.DNS = ipamResult.DNS
 
-		if err1 := netns.Do(func(_ ns.NetNS) error {
+	}
+
+	// Delete link if err to avoid link leak in this ns
+	defer func() {
+		if err != nil {
+			// Invoke ipam del if err to avoid ip leak
+			if isLayer3 {
+				ipam.ExecDel(netConf.IPAM.Type, args.StdinData)
+			}
+			// remember to destroy devices that have been moved to the container netns
+			netns.Do(func(_ ns.NetNS) error {
+				return util.LinkDelete(args.IfName)
+			})
+			util.LinkDelete(netConf.DeviceID)
+		}
+	}()
+
+	macvtapInterface, err = util.ConfigureInterface(netConf.DeviceID, args.IfName, mac, netConf.MTU, netConf.IsPromiscuous, netns)
+	if err != nil {
+		logger.Println(err)
+		return err
+	}
+
+	result.Interfaces = []*current.Interface{macvtapInterface}
+
+	if isLayer3 {
+		setIPAMResultErr := netns.Do(func(_ ns.NetNS) error {
 			_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv4/conf/%s/arp_notify", args.IfName), "1")
-			if netConf.IsVmPod {
-				// TODO 在vmpod下网卡保持原配
-				return ipam.ConfigureIface(args.IfName, ipamResult)
-			} else {
-				// TODO 在普通pod下配置其网卡属性
+			if !netConf.IsVmPod {
+				// TODO 普通pod下配置网卡
 				return ipam.ConfigureIface(args.IfName, result)
 			}
-			//for _, ipc := range result.IPs {
-			//	if ipc.Version == "4" {
-			//		arperr := arping.GratuitousArpOverIfaceByName(ipc.Address.IP, args.IfName)
-			//		if arperr != nil {
-			//			logger.Println("arping GratuitousArpOverIfaceByName invoke error: ", arperr.Error())
-			//		}
-			//	}
-			//}
-		}); err1 != nil {
-			logger.Println("Configure ipam error: ", err1.Error())
-			// return err
+			// TODO vm pod下保持原网卡属性
+			return nil
+		})
+		if setIPAMResultErr != nil {
+			logger.Println("Configure IPAM result error: ", setIPAMResultErr.Error())
 		}
 	}
+
 	rs, _ := json.Marshal(result)
 	logger.Println("CmdAdd result: ", string(rs))
+
 	return types.PrintResult(result, cniVersion)
 }
 
 // CmdDel - CNI plugin Interface
 func CmdDel(args *skel.CmdArgs) error {
+	logger.Println("CmdDel")
+	logger.Println(
+		"ContainerID: ", args.ContainerID,
+		"Netns: ", args.Netns,
+		"IfName: ", args.IfName,
+		"Args: ", args.Args,
+		"Path: ", args.Path,
+		"StdinData: ", string(args.StdinData))
+
 	netConf, _, err := loadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
 	}
+
+	netConfBytes, _ := json.Marshal(netConf)
+	logger.Println("Del NetConf: ", string(netConfBytes))
+
 	isLayer3 := netConf.IPAM.Type != ""
 
 	if isLayer3 {
 		err = ipam.ExecDel(netConf.IPAM.Type, args.StdinData)
 		if err != nil {
+			logger.Println("Exec IPAM delete error: ", err.Error())
 			return err
 		}
 	}
@@ -288,15 +257,15 @@ func CmdDel(args *skel.CmdArgs) error {
 	// There is a netns so try to clean up. Delete can be called multiple times
 	// so don't return an error if the device is already removed.
 	err = ns.WithNetNSPath(args.Netns, func(_ ns.NetNS) error {
-
-		if err := ip.DelLinkByName(args.IfName); err != nil {
-			if err != ip.ErrLinkNotFound {
-				return err
-			}
+		err := ip.DelLinkByName(args.IfName)
+		if err != nil && err != ip.ErrLinkNotFound {
+			return err
 		}
 		return nil
 	})
-
+	if err != nil {
+		logger.Println("Delete netns ", args.Netns, " macvtap link ", args.IfName, " error: ", err.Error())
+	}
 	return err
 }
 

@@ -2,11 +2,12 @@ package deviceplugin
 
 import (
 	"fmt"
+	"sort"
+
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/golang/glog"
 	"golang.org/x/net/context"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
-	"sort"
 
 	"github.com/kubevirt/macvtap-cni/pkg/util"
 )
@@ -116,7 +117,7 @@ loop:
 }
 
 func (mdp *macvtapDevicePlugin) Allocate(ctx context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
-	glog.Info("assign macvtap network devices: ", &r.ContainerRequests)
+	glog.Infoln("assign macvtap network devices: ", &r.ContainerRequests)
 	var response pluginapi.AllocateResponse
 
 	for _, req := range r.ContainerRequests {
@@ -137,14 +138,12 @@ func (mdp *macvtapDevicePlugin) Allocate(ctx context.Context, r *pluginapi.Alloc
 				mdp.RLock()
 				defer mdp.RUnlock()
 				var err error
-				glog.Info("create macvtap link ", "deviceName:", name, ",lowerDeviceName:", mdp.LowerDevice, ",mode:", mdp.Mode)
+				glog.Infoln("create macvtap link ", "deviceName:", name, ",lowerDeviceName:", mdp.LowerDevice, ",mode:", mdp.Mode)
 				index, err = util.RecreateMacvtap(name, mdp.LowerDevice, mdp.Mode)
-				if err != nil {
-					glog.Errorf("create macvtap failed: ", err.Error())
-				}
 				return err
 			})
 			if err != nil {
+				glog.Errorf("create macvtap link failed: %v", err)
 				return nil, err
 			}
 			// 在宿主机上创建的macvtap设备分配给容器/授予权限
@@ -155,12 +154,11 @@ func (mdp *macvtapDevicePlugin) Allocate(ctx context.Context, r *pluginapi.Alloc
 			dev.Permissions = "rw"
 			devices = append(devices, dev)
 		}
-
 		response.ContainerResponses = append(response.ContainerResponses, &pluginapi.ContainerAllocateResponse{
 			Devices: devices,
 		})
 	}
-	glog.Info("network device allocation successful: ", &response.ContainerResponses)
+	glog.Infoln("network device allocation successful: ", &response.ContainerResponses)
 	return &response, nil
 }
 
@@ -175,16 +173,16 @@ func (mdp *macvtapDevicePlugin) GetDevicePluginOptions(context.Context, *plugina
 }
 
 func (mdp *macvtapDevicePlugin) GetPreferredAllocation(_ context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
-	glog.Info("Into GetPreferredAllocation: ", &req.ContainerRequests)
+	glog.Infoln("Into GetPreferredAllocation: ", &req.ContainerRequests)
 	response := make([]*pluginapi.ContainerPreferredAllocationResponse, len(req.ContainerRequests))
 	resp := &pluginapi.PreferredAllocationResponse{
 		ContainerResponses: response,
 	}
 	for i, request := range req.GetContainerRequests() {
 		availableDeviceIDs := request.GetAvailableDeviceIDs()
-		glog.V(3).Info("current container[", i, "] request AvailableDeviceIDs: ", availableDeviceIDs)
-		glog.V(3).Info("current container[", i, "] request MustIncludeDeviceIDs: ", request.GetMustIncludeDeviceIDs())
-		glog.V(3).Info("current container[", i, "] request AllocationSize: ", request.GetAllocationSize())
+		glog.V(3).Infoln("current container[", i, "] request AvailableDeviceIDs: ", availableDeviceIDs)
+		glog.V(3).Infoln("current container[", i, "] request MustIncludeDeviceIDs: ", request.GetMustIncludeDeviceIDs())
+		glog.V(3).Infoln("current container[", i, "] request AllocationSize: ", request.GetAllocationSize())
 		sort.Strings(availableDeviceIDs)
 		response[i] = &pluginapi.ContainerPreferredAllocationResponse{
 			DeviceIDs: availableDeviceIDs[0:request.GetAllocationSize()],

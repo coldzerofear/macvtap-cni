@@ -1,11 +1,13 @@
 package util
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"time"
 
+	"github.com/containernetworking/plugins/pkg/ipam"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 
@@ -106,7 +108,7 @@ func isSuitableMacvtapParent(link netlink.Link) bool {
 	}
 
 	switch link.(type) {
-	case *netlink.Bond, *netlink.Device:
+	case *netlink.Bond, *netlink.Device, *netlink.Vlan:
 	default:
 		return false
 	}
@@ -224,48 +226,45 @@ func onLinkEvent(match func(netlink.Link) bool, nsPath string, do func(), stop <
 	}
 }
 
-func SetInterfaceMacAddress(ifaceName string, macAddr *net.HardwareAddr, netns ns.NetNS) error {
-	err := netns.Do(func(_ ns.NetNS) error {
-		macvtapIface, err := netlink.LinkByName(ifaceName)
+func ExecIPAMAdd(ipamType string, stdinData []byte) (*current.Result, error) {
+	// run the IPAM plugin and get back the config to apply
+	r, err := ipam.ExecAdd(ipamType, stdinData)
+	if err != nil {
+		err = fmt.Errorf("Failed to execute IPAM add: %v", err)
+		return nil, err
+	}
+
+	// Invoke ipam del if err to avoid ip leak
+	defer func() {
 		if err != nil {
-			return fmt.Errorf("failed to lookup device %q: %v", ifaceName, err)
+			ipam.ExecDel(ipamType, stdinData)
 		}
-		if err = netlink.LinkSetDown(macvtapIface); err != nil {
-			return err
-		}
-		if err = netlink.LinkSetHardwareAddr(macvtapIface, *macAddr); err != nil {
-			return fmt.Errorf("failed to add hardware addr to %q: %v", ifaceName, err)
-		}
-		if err := netlink.LinkSetUp(macvtapIface); err != nil {
-			return fmt.Errorf("failed to set macvtap iface up: %v", err)
-		}
-		return nil
-	})
-	return err
-}
+	}()
 
-func HasInterfaceInNs(ifaceName string, netns ns.NetNS) bool {
-	isNotFound := true
-	_ = netns.Do(func(_ ns.NetNS) error {
-		_, err := netlink.LinkByName(ifaceName)
-		_, isNotFound = err.(netlink.LinkNotFoundError)
-		return err
-	})
-	return !isNotFound
-}
+	// Convert whatever the IPAM result was into the current Result type
+	var ipamResult *current.Result
+	ipamResult, err = current.NewResultFromResult(r)
+	if err != nil {
+		err = fmt.Errorf("Failed to convert IPAM result: %v", err)
+		return nil, err
+	}
 
-func HasInterface(ifaceName string) bool {
-	_, err := netlink.LinkByName(ifaceName)
-	_, ok := err.(netlink.LinkNotFoundError)
-	return !ok
+	if len(ipamResult.IPs) == 0 {
+		err = errors.New("IPAM plugin returned missing IP config")
+		return nil, err
+	}
+	return ipamResult, nil
 }
 
 // Move an existing macvtap interface from the current netns to the target netns, and rename it..
 // Optionally configure the MAC address of the interface and the link's MTU.
 func ConfigureInterface(currentIfaceName string, newIfaceName string, macAddr *net.HardwareAddr, mtu int, promisc bool, netns ns.NetNS) (*current.Interface, error) {
-	var err error
-
-	macvtapIface, err := netlink.LinkByName(currentIfaceName)
+	var (
+		err          error
+		macvtapIface netlink.Link
+		macvtap      *current.Interface
+	)
+	macvtapIface, err = netlink.LinkByName(currentIfaceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup device %q: %v", currentIfaceName, err)
 	}
@@ -274,8 +273,6 @@ func ConfigureInterface(currentIfaceName string, newIfaceName string, macAddr *n
 	if err = netlink.LinkSetNsFd(macvtapIface, int(netns.Fd())); err != nil {
 		return nil, fmt.Errorf("failed to move iface %s to the netns %d because: %v", macvtapIface, netns.Fd(), err)
 	}
-
-	var macvtap *current.Interface = nil
 
 	// configure the macvtap iface
 	err = netns.Do(func(_ ns.NetNS) error {
@@ -287,43 +284,44 @@ func ConfigureInterface(currentIfaceName string, newIfaceName string, macAddr *n
 		}()
 
 		if mtu != 0 {
-			if err := netlink.LinkSetMTU(macvtapIface, mtu); err != nil {
+			if err = netlink.LinkSetMTU(macvtapIface, mtu); err != nil {
 				return fmt.Errorf("failed to set the macvtap MTU for %s: %v", currentIfaceName, err)
 			}
 		}
 
 		if macAddr != nil {
-			if err := netlink.LinkSetHardwareAddr(macvtapIface, *macAddr); err != nil {
+			if err = netlink.LinkSetHardwareAddr(macvtapIface, *macAddr); err != nil {
 				return fmt.Errorf("failed to add hardware addr to %q: %v", currentIfaceName, err)
 			}
 		}
 
 		if promisc {
-			if err := netlink.SetPromiscOn(macvtapIface); err != nil {
+			if err = netlink.SetPromiscOn(macvtapIface); err != nil {
 				return fmt.Errorf("failed to enable promiscous mode on %q: %v", currentIfaceName, err)
 			}
 		}
 
-		renamedMacvtapIface, err := renameInterface(macvtapIface, newIfaceName)
+		var renamedMacvtapIface netlink.Link
+		renamedMacvtapIface, err = renameInterface(macvtapIface, newIfaceName)
 		if err != nil {
 			return err
 		}
 
-		if err := netlink.LinkSetUp(renamedMacvtapIface); err != nil {
+		if err = netlink.LinkSetUp(renamedMacvtapIface); err != nil {
 			return fmt.Errorf("failed to set macvtap iface up: %v", err)
 		}
 
 		// Re-fetch macvtap to get all properties/attributes
 		// This enables us to report back the MAC address assigned to the macvtap iface
 		// and now that we've handed the macvtap over, update the netns where it runs
-		macvtapIface, err = netlink.LinkByName(newIfaceName)
+		renamedMacvtapIface, err = netlink.LinkByName(newIfaceName)
 		if err != nil {
 			return err
 		}
 
 		macvtap = &current.Interface{
 			Name:    newIfaceName,
-			Mac:     macvtapIface.Attrs().HardwareAddr.String(),
+			Mac:     renamedMacvtapIface.Attrs().HardwareAddr.String(),
 			Sandbox: netns.Path(),
 		}
 

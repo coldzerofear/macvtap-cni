@@ -20,8 +20,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"reflect"
 	"runtime"
-	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -41,7 +41,6 @@ type NetConf struct {
 	IsPromiscuous bool   `json:"promiscMode,omitempty"`
 	Mac           string `json:"mac,omitempty"`
 
-	IsVmPod       bool `json:"isVmPod,omitempty"`
 	RuntimeConfig struct {
 		Mac string `json:"mac,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
@@ -50,8 +49,7 @@ type NetConf struct {
 // EnvArgs structure represents inputs sent from each VMI via environment variables
 type EnvArgs struct {
 	types.CommonArgs
-	MAC          types.UnmarshallableString `json:"mac,omitempty"`
-	K8S_POD_NAME types.UnmarshallableString `json:"k8s_pod_name,omitempty"`
+	MAC types.UnmarshallableString `json:"mac,omitempty"`
 }
 
 var logger *log.Logger
@@ -80,9 +78,6 @@ func loadConf(bytes []byte, envArgs string) (*NetConf, string, error) {
 		}
 		if env.MAC != "" {
 			n.Mac = string(env.MAC)
-		}
-		if env.K8S_POD_NAME != "" {
-			n.IsVmPod = strings.HasPrefix(string(env.K8S_POD_NAME), "virt-launcher-")
 		}
 	}
 	if n.RuntimeConfig.Mac != "" {
@@ -142,8 +137,11 @@ func CmdAdd(args *skel.CmdArgs) error {
 
 	var (
 		macvtapInterface *current.Interface
-		result           = &current.Result{CNIVersion: cniVersion}
-		isLayer3         = netConf.IPAM.Type != ""
+		result           = &current.Result{
+			CNIVersion: cniVersion,
+			DNS:        netConf.DNS,
+		}
+		isLayer3 = netConf.IPAM.Type != ""
 	)
 
 	if isLayer3 {
@@ -173,8 +171,14 @@ func CmdAdd(args *skel.CmdArgs) error {
 
 		result.IPs = ipamResult.IPs
 		result.Routes = ipamResult.Routes
-		result.DNS = ipamResult.DNS
+		if !reflect.DeepEqual(ipamResult.DNS, types.DNS{}) {
+			result.DNS = ipamResult.DNS
+		}
 
+		for _, ipc := range result.IPs {
+			// All addresses apply to the container macvlan interface
+			ipc.Interface = current.Int(0)
+		}
 	}
 
 	// Delete link if err to avoid link leak in this ns
@@ -203,12 +207,9 @@ func CmdAdd(args *skel.CmdArgs) error {
 	if isLayer3 {
 		setIPAMResultErr := netns.Do(func(_ ns.NetNS) error {
 			_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv4/conf/%s/arp_notify", args.IfName), "1")
-			if !netConf.IsVmPod {
-				// TODO 普通pod下配置网卡
-				return ipam.ConfigureIface(args.IfName, result)
-			}
-			// TODO vm pod下保持原网卡属性
-			return nil
+			_, _ = sysctl.Sysctl(fmt.Sprintf("net/ipv6/conf/%s/ndisc_notify", args.IfName), "1")
+
+			return ipam.ConfigureIface(args.IfName, result)
 		})
 		if setIPAMResultErr != nil {
 			logger.Println("Configure IPAM result error: ", setIPAMResultErr.Error())
